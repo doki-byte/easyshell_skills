@@ -1,0 +1,21 @@
+{
+  "EASYSHELL_URL": "http://127.0.0.1:8080",
+  "EASYSHELL_TOKEN": "<运行 easyshell_config.py 后自动填入>",
+  "EASYSHELL_BASICAUTH": "",
+  "default_uid": "",
+  "clients_online": 0,
+  "created": "",
+  "setup_method": "easyshell_config.py",
+  "supported_targets": ["cursor", "claude", "claude-settings", "claude-mcp", "codex", "project-cursor", "project-codex"],
+  "note": "复制为 config（含真实 Token，勿提交 git）。推荐: python easyshell_config.py --reinstall",
+  "mcpServers": {
+    "easyshell": {
+      "command": "python",
+      "args": ["<本目录>/server.py"],
+      "env": {
+        "EASYSHELL_URL": "http://127.0.0.1:8080",
+        "EASYSHELL_TOKEN": "<JWT>"
+      }
+    }
+  }
+}
