@@ -104,6 +104,25 @@ Agent 会自动调用 `easyshell_*` MCP 工具。
 
 ---
 
+## 截屏与对话展示
+
+单次截屏走同步 REST（实时键鼠/录屏仍是 Web WebSocket 流），截图会保存为**本机图片**，
+在对话里直接打开即可看到并让模型分析画面：
+
+```
+easyshell_screen_capture(uid)           # ① 截屏：图片落 easyshell_screenshots/ + 归档服务端历史
+                                        # ② 用图像查看能力打开返回的本地路径 → 截图出现在对话中
+easyshell_screen_history(uid)           # ③ 换会话后回看：列出归档
+easyshell_screen_history_get(id)        #    下载归档图到本机
+easyshell_screen_history_delete(id)     #    清理归档
+```
+
+- 默认保存目录：MCP 工作目录下 `easyshell_screenshots/`，可用环境变量 `EASYSHELL_SCREENSHOT_DIR` 修改
+- 慢 Beacon（http/dns、sleep 大）先 `easyshell_set_sleep(uid, 3)` 再截，必要时加大 `timeout`（上限 300s）
+- 无桌面会话的 Windows 宿主会截屏失败（Shell 中 `!Error` 有原因），非工具问题
+
+---
+
 ## 加载 Skills
 
 `--reinstall` 已自动同步到 `.cursor/skills/`。也可手动 `@` 引用：
@@ -137,7 +156,8 @@ easyshell-package/
 │   ├── easyshell-phishing/
 │   └── easyshell-payload/       # 载荷生成与 Web 投递
 ├── skill/easyshell-pentest.md
-└── memory/
+├── memory/
+└── easyshell_screenshots/   # MCP 截屏落盘（运行时生成于 MCP 工作目录；可用 EASYSHELL_SCREENSHOT_DIR 指定）
 ```
 
 ---

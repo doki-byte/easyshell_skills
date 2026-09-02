@@ -155,8 +155,17 @@ class EasyShellAPI:
         json_body: Any = None,
         params: Optional[dict[str, Any]] = None,
         skip_encrypt: bool = False,
+        plain_query: bool = False,
         timeout: Optional[float] = None,
     ) -> Any:
+        """发起控制台 API 请求。
+
+        - POST/PUT/PATCH + json_body：AES-GCM 加密请求体（服务端强制要求）。
+        - GET/DELETE：RSA 传 AES key/iv 头；params 经 X-Enc-Params 加密进 header。
+        - DELETE + json_body：body 走明文 JSON + 加密头（与 easyshell_web 一致），响应仍加密。
+        - plain_query=True：服务端跳过加密的二进制 GET（如 client/screen/history/file），
+          query 直接明文、不带 X-Enc-* 头、响应不加密。
+        """
         await self.ensure_public_key()
         method = method.upper()
         url = f"{self.api_root}/{path.lstrip('/')}"
@@ -164,7 +173,12 @@ class EasyShellAPI:
         aes_key: Optional[bytes] = None
         content: Any = None
 
-        if skip_encrypt:
+        if plain_query:
+            # 对应服务端 shouldSkipAPICrypto 的 isBinaryDownloadPath：仅需 JWT，明文 query
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
+                content = json_body
+        elif skip_encrypt:
             if json_body is not None:
                 headers["Content-Type"] = "application/json"
                 content = json_body
@@ -173,6 +187,12 @@ class EasyShellAPI:
             headers["Content-Type"] = "application/json"
             headers["X-Encrypted"] = "1"
             content = envelope
+        elif method == "DELETE" and json_body is not None:
+            # EasyShell DELETE：body 不加密（decryptIncoming 只处理 POST/PUT/PATCH），明文 JSON
+            enc_headers, aes_key = self._build_get_headers()
+            headers.update(enc_headers)
+            headers["Content-Type"] = "application/json"
+            content = json_body
         elif method in ("GET", "DELETE", "POST"):
             enc_headers, aes_key = self._build_get_headers()
             headers.update(enc_headers)
@@ -182,6 +202,15 @@ class EasyShellAPI:
 
         async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
             r = await client.request(method, url, headers=headers, json=content, params=params)
+            if r.status_code >= 400 and aes_key is not None:
+                # 服务端错误响应体同样走 crw 加密（envelope），先尝试解密出明文错误再返回，
+                # 便于调用方展示 error 文案（如截屏 502/503/504）。
+                try:
+                    err_json = r.json()
+                    if isinstance(err_json, dict) and err_json.get("encrypted") and err_json.get("payload"):
+                        return self._decrypt_response(err_json, aes_key)
+                except Exception:
+                    pass
             r.raise_for_status()
             if not r.content:
                 return {}
@@ -230,17 +259,25 @@ class EasyShellAPI:
         *,
         json_body: Any = None,
         params: Optional[dict[str, Any]] = None,
+        plain_query: bool = False,
         timeout: Optional[float] = None,
     ) -> bytes:
-        """下载二进制响应（GenServer/shellcode 等；请求体仍走 AES 加密）。"""
+        """下载二进制响应（GenServer/shellcode/截屏归档图等）。
+
+        - json_body 提供时走 POST + AES 加密（GenServer、downloaded_file、stageless 等）。
+        - plain_query=True 时走明文 GET（client/screen/history/file 等服务端跳过加密的路径），
+          只带 JWT，params 直接作为 URL query。
+        """
         await self.ensure_public_key()
         url = f"{self.api_root}/{path.lstrip('/')}"
         headers = self._auth_headers()
         aes_key: Optional[bytes] = None
         content: Any = None
-        method = "POST" if json_body is not None else "GET"
+        method = "POST" if (json_body is not None and not plain_query) else "GET"
 
-        if method == "POST" and json_body is not None:
+        if plain_query:
+            pass  # 明文 query：不生成任何 X-Enc-* 头
+        elif method == "POST" and json_body is not None:
             envelope, aes_key = self._encrypt_body(json_body)
             headers["Content-Type"] = "application/json"
             headers["X-Encrypted"] = "1"

@@ -167,18 +167,20 @@ easyshell_batch_exec("uid1,uid2,uid3", 'cmd /c "whoami&hostname"')
 
 ## 七、仅 Web 支持的能力
 
-以下 **无 MCP 封装**，须用 Web 控制台：
+以下 **无 MCP 封装**（或只有部分封装），须用 Web 控制台：
 
-| 能力 | Web 入口 |
-|------|----------|
-| 屏幕截屏 / 键鼠 / 录屏历史 | /client/screen |
-| HVNC 隐藏桌面 | 客户端菜单 |
-| 交互 WebSocket 终端 | /client/shell（WS 模式） |
-| Stage 分阶段 shellcode 向导 | /Server、监听器右键 |
-| 系统设置 / 数据库 / 审计 | /System |
-| 用户账号管理 | 系统设置内 |
+| 能力 | Web 入口 | MCP |
+|------|----------|-----|
+| 屏幕键鼠实时 / 录屏流 | /client/screen（WS 流） | —（实时流不可轮询） |
+| 屏幕单次截屏 / 截屏历史 | /client/screen（REST） | ✅ `screen_capture` / `screen_history*` |
+| HVNC 隐藏桌面 | 客户端菜单 | — |
+| 交互 WebSocket 终端 | /client/shell（WS 模式） | — |
+| Stage 分阶段 shellcode 向导 | /Server、监听器右键 | — |
+| 系统设置 / 数据库 / 审计 | /System | — |
+| 用户账号管理 | 系统设置内 | — |
 
-屏幕/HVNC 为实时 WebSocket 流，MCP 轮询 `exec_cmd` 无法替代。
+屏幕/HVNC 实时画面为 WebSocket 流，MCP 轮询 `exec_cmd` 无法替代；
+但**单次截屏**是同步 REST（`GET /client/screen/capture`），MCP 已封装——截屏存本机图片后可直接在对话中展示，完整用法见 [[easyshell-real]]。
 
 ---
 

