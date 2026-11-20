@@ -19,11 +19,17 @@ description: >-
 
 ### Shell vs 内存执行
 
+**选型顺序：插件 > 文件 API > 命令。** 能从 `easyshell_list_plugins` 里找到现成插件（尤其 inline-bin 的
+fscan 之类），就别用 exec_cmd 拼一长串命令 —— 内存执行不落盘、少起进程，流量与进程噪声都小得多。
+
 | 方式 | 适用 | 特点 |
 |------|------|------|
-| `easyshell_exec_cmd` | whoami、netstat、短命令 | 轮询 shell 缓冲区 |
-| `easyshell_memory_exec` | fscan、Rubeus、BOF | 无落盘或最小落盘 |
+| `easyshell_memory_exec` / `easyshell_execute_plugin` | fscan、Rubeus、BOF、信息收集类 | **首选**：无落盘或最小落盘，噪声最小 |
 | `easyshell_read_file` | 读 txt/json 结果 | 走植入体协议，无 cmd |
+| `easyshell_exec_cmd` | whoami、netstat、短命令（且插件覆盖不到时） | 轮询 shell 缓冲区，多开 cmd.exe |
+
+降噪：命令能合并就合并（`cmd /c "a&b"`）；不在植入体上跑全段高并发扫描/爆破，
+先建 SOCKS5 在本机慢速扫（`tunneling-and-pivoting` 同理）；不反复重传同一个文件。
 
 ### 路径写法
 

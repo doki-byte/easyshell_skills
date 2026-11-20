@@ -212,22 +212,27 @@ easyshell_screen_history_delete(42)    # 清理归档
 ### ✅ 正确
 
 ```
-1. 一次只发 1 个 API，等返回再发下一个
-2. 小文件走 file/filecontent；大文件走 file/download
-3. 扫描工具用 inline-bin，避免重复上传 exe
-4. 命令合并：cmd /c "whoami&ipconfig"
-5. 隧道 force=True 复用，不反复建
-6. 会话控制在 10–20s
+1. 有插件就先用插件：执行类任务先 easyshell_list_plugins，能用 memory_exec / execute_plugin 就不拼命令
+   （内存执行不落盘、少起进程，流量与 AV 特征都小得多）
+2. 一次只发 1 个 API，等返回再发下一个
+3. 小文件走 file/filecontent；大文件走 file/download
+4. 扫描工具用 inline-bin，避免重复上传 exe
+5. 命令合并：cmd /c "whoami&ipconfig"
+6. 隧道 force=True 复用，不反复建
+7. 会话控制在 10–20s
+8. 大网段扫描/爆破先建 SOCKS5，在本机慢速做（植入体只当跳板）
 ```
 
 ### ❌ 错误
 
 ```
-1. 并行多个 sendcommand → 缓冲区乱、植入体压力大
-2. shell type 读文件 → 多余 cmd 进程
-3. fscan 不回收 / 反复上传 → 触发 AV
-4. 以为 ping 通 = TCP 通 → 隧道打不通
-5. 裸 HTTP 调 API → 加密校验失败
+1. 明明有插件却用 exec_cmd 一条条拼命令（多开 cmd.exe、噪声大）
+2. 并行多个 sendcommand → 缓冲区乱、植入体压力大
+3. shell type 读文件 → 多余 cmd 进程
+4. fscan 不回收 / 反复上传 → 触发 AV
+5. 在植入体上跑全段高并发扫描 → SYN 洪峰，流量设备一眼就看出来
+6. 以为 ping 通 = TCP 通 → 隧道打不通
+7. 裸 HTTP 调 API → 加密校验失败
 ```
 
 ---

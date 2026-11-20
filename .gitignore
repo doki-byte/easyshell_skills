@@ -1,1 +1,4 @@
 easyshell-mcp/config
+__pycache__/
+*.pyc
+easyshell_screenshots/

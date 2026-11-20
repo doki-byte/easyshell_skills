@@ -288,7 +288,16 @@ async def easyshell_list_clients(online_only: bool = True) -> str:
 async def easyshell_exec_cmd(uid: str, command: str, timeout: int = 30) -> str:
     """在植入体上执行 Shell 命令（下发后轮询 shell 缓冲区获取输出）。
 
-    合并多条命令时用 `cmd /c "whoami&ipconfig"`（Windows）或 `;`（Linux）。
+    **执行前先自问：有没有现成插件？** 只要 easyshell_list_plugins 里有能完成同一件事的插件
+    （尤其 inline-bin 的 fscan/信息收集类），就优先用 easyshell_memory_exec / easyshell_execute_plugin，
+    不要用 exec_cmd 一条条拼命令——插件在内存里跑、不落盘、少开进程，流量与进程噪声都小得多，
+    也更不容易被 AV/EDR 与流量设备抓到。
+
+    降噪纪律（违反会直接提高掉线与告警概率）：
+    - 合并下发：Windows 用 `cmd /c "a&b&c"`，Linux 用 `a; b`，不要为每条信息单发一次；
+    - 不要在植入体上跑大网段高并发扫描/爆破（那类工作建 SOCKS5 隧道后在本机慢速做）；
+    - 读取优先用 easyshell_read_file / easyshell_search_sensitive（走文件 API，不起 cmd.exe）；
+    - 同一个会话里别反复重连、反复建隧道；一次发一条，等返回再发下一条。
 
     Args:
         uid: 植入体 UID
@@ -428,6 +437,12 @@ async def easyshell_memory_exec(
     os_type: str = "windows",
 ) -> str:
     """内存执行 Extensions 插件（inline-bin / execute-assembly / inline-execute 等）。
+
+    **这是执行类操作的首选**：能完成同一件事的插件就不要改用 exec_cmd 拼命令。
+    插件在植入体内存里跑，不落地文件、少开进程，流量噪声与 AV 特征都远低于"上传 exe 再执行"。
+    典型用法：fscan 走 inline-bin（配合单网段/限速参数），信息收集类先跑插件再补少量命令。
+
+    先用 easyshell_list_plugins 看有哪些候选（relPath 就是这里的 rel_path）。
 
     Args:
         uid: 植入体 UID
@@ -809,6 +824,11 @@ async def easyshell_list_processes(uid: str) -> str:
 @mcp.tool()
 async def easyshell_upload_file(uid: str, local_path: str, remote_path: str) -> str:
     """上传本地文件到植入体（multipart，跳过加密）。
+
+    **大文件上传是最吵的操作之一**（几十 MB 的流量峰值 + 落地文件 AV 特征）。
+    能不改用上传就别传：先在植入体上用 easyshell_list_dir 确认是否已有该文件；
+    扫描类需求优先 easyshell_memory_exec 的 inline-bin（内存里跑，不落地）；
+    确需上传时控制频率，别反复重传同一个文件。
 
     Args:
         uid: 植入体 UID（完整 32 位，或唯一前缀）
@@ -1231,6 +1251,9 @@ async def easyshell_tunnel_curl(
 @mcp.tool()
 async def easyshell_list_plugins(uid: str = "", os_type: str = "windows") -> str:
     """列出可内存执行的插件候选（已登记 + Extensions 目录）。
+
+    **开始执行类任务前先调一次**：有现成插件就用插件（内存执行），没有再用 exec_cmd 拼命令。
+    只读工具，不产生任何目标侧流量。
 
     Args:
         uid: 可选，用于 postex_helper 架构解析
@@ -1710,6 +1733,9 @@ async def easyshell_upload_status(uid: str) -> str:
 @mcp.tool()
 async def easyshell_execute_plugin(uid: str, plugin_id: int, args: str = "") -> str:
     """执行已登记插件（plugin 表中的 id）。
+
+    **有插件就用插件**：这是比"上传工具再 exec_cmd"更安静的执行方式（少落地文件、少起进程）。
+    开始执行类任务前先用 easyshell_list_plugins 看有没有能直接用的登记插件。
 
     Args:
         uid: 植入体 UID

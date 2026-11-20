@@ -265,6 +265,9 @@ class EasyShellAPI:
         """下载二进制响应（GenServer/shellcode/截屏归档图等）。
 
         - json_body 提供时走 POST + AES 加密（GenServer、downloaded_file、stageless 等）。
+        - 但对服务端 `middleware.isBinaryDownloadPath` 白名单里的 POST 路径，整条中间件被跳过，
+          body 必须发明文 JSON（发加密信封会让 handler 只看到空结构体，例如 shellcode 生成报
+          "arch only supports windows_amd64..."）——见 _is_binary_download_post。
         - plain_query=True 时走明文 GET（client/screen/history/file 等服务端跳过加密的路径），
           只带 JWT，params 直接作为 URL query。
         """
@@ -277,6 +280,9 @@ class EasyShellAPI:
 
         if plain_query:
             pass  # 明文 query：不生成任何 X-Enc-* 头
+        elif method == "POST" and json_body is not None and _is_binary_download_post(path):
+            headers["Content-Type"] = "application/json"
+            content = json_body
         elif method == "POST" and json_body is not None:
             envelope, aes_key = self._encrypt_body(json_body)
             headers["Content-Type"] = "application/json"
@@ -306,6 +312,23 @@ class EasyShellAPI:
                 except json.JSONDecodeError:
                     pass
             return r.content
+
+
+# 服务端 internal/middleware/api_crypto.go 的 isBinaryDownloadPath：这些 POST 路径整条跳过
+# 请求/响应加密，body 必须是明文 JSON（否则 handler 收到加密信封，等于空结构体）。
+_BINARY_DOWNLOAD_POST_PATHS = (
+    "client/GenServer",
+    "client/downloads/downloaded_file",
+    "client/screen/history/export",
+    "shellcode/stageless",
+    "shellcode/stage",
+    "shellcode/listener-implant",
+)
+
+
+def _is_binary_download_post(path: str) -> bool:
+    rel = str(path).strip().lstrip("/").split("?")[0]
+    return rel in _BINARY_DOWNLOAD_POST_PATHS
 
 
 def client_from_env() -> EasyShellAPI:

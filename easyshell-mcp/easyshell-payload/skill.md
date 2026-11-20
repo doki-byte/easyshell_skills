@@ -7,7 +7,30 @@ description: >-
 
 # easyshell-payload: 载荷生成与投递
 
-> **核心逻辑：** 先有监听器 → 选投递方式（文件/Web/钓鱼附件/shellcode）→ 目标执行后切 [[easyshell-real]]
+> **核心逻辑：** 先有监听器 → 选投递方式 → 目标执行后切 [[easyshell-real]]
+
+---
+
+## 零之前：已经有执行能力时，走「一键上线」而不是投递
+
+**判断口径只有一句：我们能在目标上执行命令 → 一键上线；不能 → 才谈投递。**
+
+已经有 RCE / 命令注入 / webshell / 已上线植入体时，不要生成文件再想办法上传，
+也不要开 Web 投递：
+
+1. `easyshell_list_listeners()` 确认有 open 的监听器，记下 `protocol://connectAddress`；
+2. 在 TeamServer 控制台对该监听器开「一键上线」，拿到那一条上线命令（分阶段下载并执行的一行命令）；
+3. 把这条命令**直接在目标上执行**（走已有的 `easyshell_exec_cmd` / webshell / RCE 通道）；
+4. `easyshell_list_clients(online_only=True)` 轮询确认上线。
+
+**一键上线有窗口期**：默认是临时开放的分阶段下载路径，过时即失效。
+
+- 能动 TeamServer 系统设置时：打开「监听器一键上线（永久）」，让下载路径长期有效；
+- 动不了设置时：**临时开启并让它一直运行到上线为止** —— 开窗后立刻执行命令，
+  窗口内反复 `easyshell_list_clients` 确认；没上线就**重新开窗再试**，不要只发一次就判定失败；
+  确认上线（或确认放弃）后再按需关闭，别把下载路径长期裸奔。
+
+下面第二～四节的「文件投递 / Web 投递 / 钓鱼附件」都是**目标没有执行能力**时的下策。
 
 ---
 
@@ -21,8 +44,9 @@ description: >-
 
 | 投递方式 | 适用场景 | MCP 工具 |
 |----------|----------|----------|
+| **一键上线（首选）** | **已在目标上有命令执行能力** | TeamServer 控制台开「一键上线」→ 命令直接在目标执行 |
 | 客户端生成 PE/ELF | 手工投递、U 盘 | `easyshell_gen_payload` |
-| Web 投递 | HTTP 下载链接 | `easyshell_start_webdelivery` |
+| Web 投递 | 目标自己下载（无执行能力时） | `easyshell_start_webdelivery` |
 | Shellcode | 注入/加载器 | `easyshell_gen_shellcode` |
 | 钓鱼 ZIP 附件 | 邮件演练 | `easyshell_gophish_build_attachment` |
 
@@ -55,7 +79,10 @@ easyshell_gen_payload(
 
 ---
 
-## 二、Web 投递
+## 二、Web 投递（目标没有执行能力时才用）
+
+> 已经有命令执行能力时**不要**走这条路：它要额外占一个 TeamServer 端口、还要开匿名下载窗口，
+> 比「一键上线」多两个环节。只有必须让目标自己下载时才用。
 
 Web：**监听管理 → Web 投递** `/Listeners`
 
@@ -90,7 +117,8 @@ easyshell_webdelivery_control("delete", "8088")
 **注意：**
 - Web 投递端口在 **TeamServer** 上监听，下载流量不经植入体。
 - 分阶段 stage 模式需配合 `stage2_filename`；MCP 简版用默认即可，复杂配置走 Web。
-- 系统设置可开「监听器一键上线（永久）」长期开放分阶段下载路径。
+- 系统设置可开「监听器一键上线（永久）」长期开放分阶段下载路径；**能开就开**，
+  省掉每次开窗 / 重新开窗的来回。
 
 ---
 
@@ -190,19 +218,23 @@ easyshell_batch_exec("uid1,uid2,uid3", 'cmd /c "whoami&hostname"')
 
 ```
 1. 生成前先 list_listeners 确认监听器在线
-2. Web 投递先 temp-unlock 再发链接，用完 close
-3. 钓鱼附件与活动使用同一监听器
-4. 批量命令并发≤5，合并单条 cmd
-5. 生成文件勿提交 git
+2. 已在目标上有执行能力 → 开「一键上线」把命令直接执行，不要走 Web 投递
+3. 一键上线有窗口期：开不了「永久」就临时开启并持续运行到上线，没上线就重新开窗
+4. Web 投递先 temp-unlock 再发链接，用完 close
+5. 钓鱼附件与活动使用同一监听器
+6. 批量命令并发≤5，合并单条 cmd
+7. 生成文件勿提交 git
 ```
 
 ### ❌ 错误
 
 ```
 1. 监听器未 open 就 gen_payload
-2. Web 投递端口与 TeamServer 主端口冲突
-3. 对未授权目标批量投递
-4. 把 GenServer 输出路径写在植入体磁盘上（应保存到操作员本机）
+2. 明明能执行命令，却绕去开 Web 投递端口 / 生成文件再想办法上传
+3. 一键上线只发一次命令、没确认上线就判定失败（窗口期没过完就放弃）
+4. Web 投递端口与 TeamServer 主端口冲突
+5. 对未授权目标批量投递
+6. 把 GenServer 输出路径写在植入体磁盘上（应保存到操作员本机）
 ```
 
 ---

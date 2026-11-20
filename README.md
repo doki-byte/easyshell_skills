@@ -1,6 +1,6 @@
 # EasyShell MCP — 最简单使用指南
 
-把 EasyShell TeamServer 接入 Cursor / Claude Code / Codex，在对话里直接控制上线植入体。
+把 EasyShell TeamServer 接入 Cursor / Claude Code / Codex / DSH，在对话里直接控制上线植入体。
 
 ---
 
@@ -11,7 +11,7 @@
 | TeamServer | 已启动，浏览器能打开 `http://你的IP:8080` |
 | 账号 | 默认 `admin`，密码首次运行时在控制台或 `logs/` 中查看 |
 | Python | 3.10+，已安装 `pip` |
-| 客户端 | Cursor / Claude Code / Codex CLI 等支持 MCP 的工具 |
+| 客户端 | Cursor / Claude Code / Codex CLI / DSH 等支持 MCP 的工具 |
 
 验证服务可达（无需登录）：
 
@@ -42,21 +42,64 @@ python easyshell_config.py --reinstall
 | **Claude Code** | `~/.claude.json` 项目级 `mcpServers` |
 | **Claude Code** | `~/.claude/settings.json`、`~/.claude/mcp.json` |
 | **Codex** | `~/.codex/config.toml` + 项目 `.codex/config.toml` |
+| **DSH** | `$DSH_HOME/cordis.patch.yml`（home 级 patch，全 profile 生效）+ `$DSH_HOME/skills/` |
 | **Skills** | `.cursor/skills/` + 项目 `AGENTS.md` |
 
 只装部分平台：
 
 ```powershell
-python easyshell_config.py --url http://127.0.0.1:8080 --password <密码> --target cursor,claude,codex
+python easyshell_config.py --url http://127.0.0.1:8080 --password <密码> --target cursor,claude,codex,dsh
 ```
 
-仅同步 Skills：
+只装 DSH（TeamServer 暂时连不上也能装，复用上次 Token）：
 
 ```powershell
-python easyshell_config.py --install-skills
+python easyshell_config.py --target dsh
+python easyshell_config.py --target dsh --from-config
 ```
 
+仅同步 Skills（Cursor + DSH 一起）：`python easyshell_config.py --install-skills`
+
 卸载全部：`python easyshell_config.py --uninstall`
+
+---
+
+## DSH（DeepSeek Harness）一键安装
+
+DSH 的 MCP 不读 `mcp.json`，而是读 profile 的 patch 层，所以别的工具装完 DSH 依然「找不见工具」。
+本工具会把一条 `mcp-easyshell` 行写进 **home 级 patch** `$DSH_HOME/cordis.patch.yml`，
+对本机所有 profile（dsh-tui / web / desktop …）一次生效：
+
+```yaml
+- insert:
+    - id: mcp-easyshell
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: easyshell
+        transport: stdio
+        command: 'E:\Python\Python313\python.exe'
+        args: ['E:/.../easyshell-mcp/server.py']
+        env: { EASYSHELL_URL: '...', EASYSHELL_TOKEN: '...' }
+```
+
+| 行为 | 说明 |
+|------|------|
+| 工具名 | `mcp__easyshell__easyshell_exec_cmd`（DSH 固定 `mcp__<server>__<tool>` 命名） |
+| 生效 | `patchReload: live` 的 profile（dsh-tui 等）**热重载，装完即用，不用重启** |
+| 校验 | 安装后自动跑 `dsh --profile dsh-tui --dump-config`，确认 patch 真被组合（`--no-dsh-verify` 可跳过） |
+| 自定义位置 | `--dsh-home <路径>`（默认 `$DSH_HOME`，否则 `~/.dsh`） |
+| 幂等 | 重复安装只保留一份；文件里别人的 patch 行不会被删 |
+| 卸载 | `--uninstall` 或 `--target dsh` + 手工删块；文件会留 `[]`（**空文件会让 dsh 启动失败**，故不删文件） |
+| Skills | 同一步把 6 个 skill 装到 `$DSH_HOME/skills/<名>/SKILL.md`，会话里直接可见 |
+
+避坑：
+
+- 别手改 `$DSH_HOME/profiles/*/cordis.yml`（每次启动都会被重写），要改就改 `cordis.patch.yml`。
+- patch 里新增插件**必须**写成 `- insert:` 列表；直接写 `- id: xxx` 只会被当成「覆盖已存在条目」并报 `entry not found`。
+- DSH 会清洗 MCP 子进程环境（丢掉 `*TOKEN*`/`*KEY*`/`DSH_*`），所以 Token 是显式写在 `config.env` 里的，
+  不是靠继承环境变量。
+- 改 DSH 相关代码后跑一次回归自测（离线、不碰真实 `$DSH_HOME`）：
+  `python easyshell-mcp\tests\test_dsh_patch.py`
 
 ---
 
@@ -67,6 +110,10 @@ python easyshell_config.py --install-skills
 | Cursor | 设置 → MCP → `easyshell` 绿色 |
 | Claude Code | 重启后输入 `/mcp`，应有 `easyshell_*` 工具 |
 | Codex | 重启 CLI，输入 `/mcp` 或问模型能否调用 easyshell 工具 |
+| DSH | 直接问「列出所有在线植入体」；看工具名应是 `mcp__easyshell__easyshell_list_clients`。没出现就重跑 `--target dsh`，它自带 `--dump-config` 校验 |
+
+DSH 排障一句话版：**工具名以 `mcp__easyshell__` 开头＝装好了**；只有 `easyshell_*` 一个都看不见，说明 patch 没被组合，跑
+`dsh --profile dsh-tui --dump-config | Select-String easyshell` 看条目在不在。
 
 ---
 
@@ -80,7 +127,7 @@ python easyshell_config.py --install-skills
 对 uid=xxx 执行 whoami 和 ipconfig，合并成一条命令
 ```
 
-Agent 会自动调用 `easyshell_*` MCP 工具。
+Agent 会自动调用 `easyshell_*` MCP 工具（DSH 里是 `mcp__easyshell__easyshell_*`，用法一致）。
 
 ---
 
@@ -125,18 +172,19 @@ easyshell_screen_history_delete(id)     #    清理归档
 
 ## 加载 Skills
 
-`--reinstall` 已自动同步到 `.cursor/skills/`。也可手动 `@` 引用：
+`--reinstall` 已自动同步到 `.cursor/skills/`（Cursor）与 `$DSH_HOME/skills/`（DSH）。也可手动 `@` 引用：
 
-| Skill | 路径 |
+| Skill | 仓库内权威源 |
 |-------|------|
-| easyshell-mcp | `.cursor/skills/easyshell-mcp/SKILL.md` |
+| easyshell-mcp | `easyshell-mcp/easyshell-mcp/skill.md` |
 | easyshell-real | `easyshell-mcp/easyshell-real/skill.md` |
 | easyshell-lateral | `easyshell-mcp/easyshell-lateral/skill.md` |
 | easyshell-phishing | `easyshell-mcp/easyshell-phishing/skill.md` |
 | easyshell-payload | `easyshell-mcp/easyshell-payload/skill.md` |
 | easyshell-pentest | `skill/easyshell-pentest.md` |
 
-Codex / Claude 也会读取项目根目录 `AGENTS.md` 中的技能索引。
+Codex / Claude / DSH 也会读取项目根目录 `AGENTS.md` 中的技能索引；
+DSH 的 skill 是 `<dshHome>/skills/<名>/SKILL.md` bundle（frontmatter 必须含 `name` + `description`，本仓库已就绪）。
 
 ---
 
@@ -148,9 +196,10 @@ easyshell-package/
 ├── easyshell-mcp/
 │   ├── server.py
 │   ├── easyshell_api.py
-│   ├── easyshell_config.py      # 多平台一键配置
+│   ├── easyshell_config.py      # 多平台一键配置（含 DSH patch 层）
 │   ├── pentest_common.py        # 脚本公共 API
 │   ├── pentest/                 # 一次性渗透脚本（74 个）
+│   ├── easyshell-mcp/           # MCP 工具与 API 映射 skill
 │   ├── easyshell-real/
 │   ├── easyshell-lateral/
 │   ├── easyshell-phishing/
@@ -206,4 +255,5 @@ Web 顶栏 **邮件钓鱼**（需系统设置开启 `gophish_enabled`）：
 - TeamServer：`easyshell_server/docs/USAGE.md`
 - 内网横向：`easyshell-mcp/easyshell-lateral/easyshell-mcp-guide.md`
 - 隧道方法论：`memory/easyshell-tunnel-lessons.md`
+- DSH 接入踩坑：`memory/easyshell-dsh-lessons.md`
 - 实战复盘：`memory/easyshell-ops-lessons.md`
