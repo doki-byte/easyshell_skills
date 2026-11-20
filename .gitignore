@@ -2,3 +2,8 @@ easyshell-mcp/config
 __pycache__/
 *.pyc
 easyshell_screenshots/
+
+# 本地备份与临时产物（不参与版本管理）
+*.bak-*
+easyshell-mcp/easyshell-mcp/
+
