@@ -94,7 +94,10 @@ def project_keys() -> list[str]:
     return out
 
 
-async def login_and_verify(base_url: str, username: str, password: str, use_basic: bool = False):
+async def login_and_verify(base_url: str, username: str, password: str, use_basic: bool = True):
+    # 控制台开启 Basic（默认开启）时，/users/login 也要求 Authorization: Basic，
+    # 且 Basic 用户必须与表单用户名一致；不带 Basic 会固定 401「需要通过 HTTP Basic 认证」。
+    # 未开启 Basic 的服务端会忽略该头，所以默认始终带上（与 Web 前端行为一致）。
     basic = None
     if use_basic:
         basic = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
@@ -782,7 +785,8 @@ async def main_async(args):
         base_url = args.url or get_input("EasyShell 地址", "http://127.0.0.1:8080")
         username = args.username or get_input("用户名", "")
         password = args.password or get_input("密码", "")
-        token, basic, api = await login_and_verify(base_url, username, password, use_basic=args.basic)
+        # use_basic 默认 True：Basic 开启时登录接口强制校验 Basic（与表单账号一致）。
+        token, basic, api = await login_and_verify(base_url, username, password, use_basic=True)
         if not token:
             print("\n  ✗ 登录失败。TeamServer 暂时不可达时，可先用已有 Token 安装：")
             print("     python easyshell_config.py --target dsh --from-config")
